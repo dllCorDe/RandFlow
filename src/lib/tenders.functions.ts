@@ -60,6 +60,14 @@ export type GraphNode = {
   tone: "company" | "live" | "closed";
   tenderId: number | null;
   degree: number;
+  entityRole?: "supplier" | "buyer";
+  status?: string;
+  totalAwardedCents?: string;
+  missingAwardAmounts?: number;
+  description?: string;
+  buyer?: string;
+  province?: string;
+  awards?: TenderAward[];
 };
 
 export type GraphLink = {
@@ -72,6 +80,8 @@ export type LinkGraph = {
   nodes: GraphNode[];
   links: GraphLink[];
   total: number;
+  partial?: boolean;
+  loadedAll?: boolean;
 };
 
 type Raw = Record<string, unknown>;
@@ -144,7 +154,10 @@ function awardsOf(raw: Raw): TenderAward[] {
     return [
       {
         company,
-        amount: asText(award.tenderAmount) || "Amount not published",
+        amount:
+          (typeof award.tenderAmount === "number" && Number.isFinite(award.tenderAmount)
+            ? award.tenderAmount.toFixed(2)
+            : asText(award.tenderAmount)) || "Amount not published",
         date: prettyDate(award.awardDate),
         size: sizeLabel(asText(award.enterpriseType)),
         points: points || null,
@@ -238,7 +251,9 @@ async function filterOnce(query: Record<string, string>): Promise<{ total: numbe
 }
 
 export const listTenders = createServerFn({ method: "GET" })
-  .validator((data: { province?: string; status?: string; page?: number; company?: string }) => data)
+  .validator(
+    (data: { province?: string; status?: string; page?: number; company?: string }) => data,
+  )
   .handler(async ({ data }): Promise<TenderPage> => {
     const province = PROVINCE_IDS.has(data?.province ?? "") ? (data?.province ?? "") : "";
     const status = STATUS_IDS.has(data?.status ?? "") ? (data?.status ?? "1") : "1";
@@ -354,32 +369,89 @@ export const readTender = createServerFn({ method: "GET" })
   });
 
 function slug(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "unknown";
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "unknown"
+  );
+}
+
+export function awardCents(amount: string): bigint | null {
+  let value = amount
+    .trim()
+    .replace(/^(ZAR|R)\s*/i, "")
+    .replace(/\s/g, "");
+  if (!/^\d[\d.,]*$/.test(value)) return null;
+  const separator = Math.max(value.lastIndexOf(","), value.lastIndexOf("."));
+  const decimals = separator >= 0 && [1, 2].includes(value.length - separator - 1);
+  const whole = (decimals ? value.slice(0, separator) : value).replace(/[.,]/g, "");
+  if (!/^\d+$/.test(whole)) return null;
+  value = decimals ? value.slice(separator + 1).padEnd(2, "0") : "00";
+  return BigInt(whole) * 100n + BigInt(value);
+}
+
+async function graphRecords(query: Record<string, string>, all: boolean) {
+  const first = await filterOnce({ ...query, length: all ? "200" : query.length });
+  let incomplete = false;
+  if (all) {
+    const ids = new Set(first.rows.map((row) => Number(row.id)));
+    for (let start = first.rows.length; start < first.total;) {
+      try {
+        const page = { ...query, start: String(start), length: "200" };
+        const next = await filterOnce(page).catch(() => filterOnce(page));
+        if (!next.rows.length) {
+          incomplete = true;
+          break;
+        }
+        if (next.rows.every((row) => ids.has(Number(row.id)))) {
+          incomplete = true;
+          break;
+        }
+        for (const row of next.rows) ids.add(Number(row.id));
+        first.rows.push(...next.rows);
+        start += next.rows.length;
+      } catch (error) {
+        console.warn("[tender graph] Province page unavailable", {
+          province: query.province,
+          status: query.status,
+          start,
+          error: error instanceof Error ? error.message : "Request failed",
+        });
+        incomplete = true;
+        break;
+      }
+    }
+  }
+  return { ...first, incomplete };
 }
 
 export const loadLinkGraph = createServerFn({ method: "GET" })
-  .validator((data: { company?: string; province?: string }) => data)
+  .validator((data: { company?: string; province?: string; all?: boolean }) => data)
   .handler(async ({ data }): Promise<LinkGraph> => {
     const company = asText(data?.company).slice(0, 80);
     const province = PROVINCE_IDS.has(data?.province ?? "") ? (data?.province ?? "") : "";
+    const all = Boolean(data?.all && province);
     const lengths = company
       ? { awarded: "18", closed: "10", open: "8" }
       : { awarded: "14", closed: "8", open: "6" };
-    const [awarded, closed, open] = await Promise.all([
-      filterOnce({ status: "2", company, province, length: lengths.awarded }).catch(() => ({
-        total: 0,
-        rows: [] as Raw[],
-      })),
-      filterOnce({ status: "3", company, province, length: lengths.closed }).catch(() => ({
-        total: 0,
-        rows: [] as Raw[],
-      })),
-      filterOnce({ status: "1", company, province, length: lengths.open }).catch(() => ({
-        total: 0,
-        rows: [] as Raw[],
-      })),
+    const results = await Promise.allSettled([
+      graphRecords({ status: "2", company, province, length: lengths.awarded }, all),
+      graphRecords({ status: "3", company, province, length: lengths.closed }, all),
+      graphRecords({ status: "1", company, province, length: lengths.open }, all),
+      all
+        ? graphRecords({ status: "4", company, province, length: "200" }, true)
+        : Promise.resolve({ total: 0, rows: [] as Raw[], incomplete: false }),
     ]);
-    const rows = [...awarded.rows, ...open.rows, ...closed.rows];
+    if (results.slice(0, all ? 4 : 3).every((result) => result.status === "rejected")) {
+      throw new Error("Treasury’s tender service is unavailable.");
+    }
+    const [awarded, closed, open, cancelled] = results.map((result) =>
+      result.status === "fulfilled"
+        ? result.value
+        : { total: 0, rows: [] as Raw[], incomplete: true },
+    );
+    const rows = [...awarded.rows, ...open.rows, ...closed.rows, ...cancelled.rows];
     const companies = new Map<string, GraphNode>();
     const jobs: GraphNode[] = [];
     const links: GraphLink[] = [];
@@ -389,28 +461,55 @@ export const loadLinkGraph = createServerFn({ method: "GET" })
       const tenderId = Number(raw.id) || 0;
       if (!tenderId || seen.has(tenderId)) continue;
       seen.add(tenderId);
-      if (jobs.length >= 28) break;
+      if (!all && jobs.length >= 28) break;
       const status = asText(raw.status);
-      const live = status === "Awarded" || status === "Published" || status === "Evaluation" || status === "Adjudication";
+      const live =
+        status === "Awarded" ||
+        status === "Published" ||
+        status === "Evaluation" ||
+        status === "Adjudication";
       const tone: "live" | "closed" = live ? "live" : "closed";
       const awards = awardsOf(raw);
       const winner = awards[0]?.company ?? "";
       const buyer = asText(raw.organ_of_State) || asText(raw.department) || "Unknown buyer";
-      const anchorName = winner || buyer;
-      const anchorId = `co-${slug(anchorName)}`;
-      const existing = companies.get(anchorId);
-      if (existing) {
-        existing.degree += 1;
-      } else {
-        companies.set(anchorId, {
-          id: anchorId,
-          kind: "company",
-          label: anchorName,
-          detail: winner ? "Won the linked jobs." : "Asked for the work. No winning company is published.",
-          tone: "company",
-          tenderId: null,
-          degree: 1,
-        });
+      // A tender can have several awarded suppliers; include every published winner.
+      const anchorNames = [...new Set(awards.map((award) => award.company))];
+      if (!anchorNames.length) anchorNames.push(buyer);
+      const anchorIds = [
+        ...new Set(anchorNames.map((name) => `${winner ? "co" : "buyer"}-${slug(name)}`)),
+      ];
+      for (const anchorId of anchorIds) {
+        const anchorName = anchorNames.find(
+          (name) => `${winner ? "co" : "buyer"}-${slug(name)}` === anchorId,
+        )!;
+        const existing = companies.get(anchorId);
+        if (existing) existing.degree += 1;
+        else
+          companies.set(anchorId, {
+            id: anchorId,
+            kind: "company",
+            label: anchorName,
+            detail: winner
+              ? "Won the linked jobs."
+              : "Asked for the work. No winning company is published.",
+            tone: "company",
+            tenderId: null,
+            degree: 1,
+            entityRole: winner ? "supplier" : "buyer",
+            totalAwardedCents: "0",
+            missingAwardAmounts: 0,
+          });
+        if (status === "Awarded" && winner) {
+          const node = companies.get(anchorId)!;
+          for (const award of awards.filter(
+            (award) => `${"co"}-${slug(award.company)}` === anchorId,
+          )) {
+            const cents = awardCents(award.amount);
+            if (cents === null) node.missingAwardAmounts = (node.missingAwardAmounts ?? 0) + 1;
+            else
+              node.totalAwardedCents = (BigInt(node.totalAwardedCents ?? "0") + cents).toString();
+          }
+        }
       }
       const jobId = `job-${tenderId}`;
       const number = asText(raw.tender_No) || `Tender ${tenderId}`;
@@ -422,8 +521,8 @@ export const loadLinkGraph = createServerFn({ method: "GET" })
         detail: [
           status || (live ? "Open" : "Closed"),
           asText(raw.province),
-          winner ? `Awarded to ${winner}` : "No winner published",
-          amount && amount !== "Amount not published" ? amount : "",
+          winner ? `Awarded to ${anchorNames.join(", ")}` : "No winner published",
+          awards.length === 1 && amount && amount !== "Amount not published" ? amount : "",
           (asText(raw.description) || "").slice(0, 180),
         ]
           .filter(Boolean)
@@ -431,13 +530,25 @@ export const loadLinkGraph = createServerFn({ method: "GET" })
         tone,
         tenderId,
         degree: 1,
+        status: status || (live ? "Open" : "Closed"),
+        description: asText(raw.description),
+        buyer,
+        province: asText(raw.province),
+        awards,
       });
-      links.push({ source: anchorId, target: jobId, tone });
+      for (const anchorId of anchorIds) links.push({ source: anchorId, target: jobId, tone });
     }
 
     return {
       nodes: [...companies.values(), ...jobs],
       links,
-      total: awarded.total + closed.total + open.total,
+      total: awarded.total + closed.total + open.total + cancelled.total,
+      partial:
+        results.some((result) => result.status === "rejected") ||
+        [awarded, closed, open, cancelled].some((result) => result.incomplete),
+      loadedAll:
+        all &&
+        !results.some((result) => result.status === "rejected") &&
+        ![awarded, closed, open, cancelled].some((result) => result.incomplete),
     };
   });

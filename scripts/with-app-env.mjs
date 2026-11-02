@@ -111,7 +111,12 @@ function main(argv) {
     process.exit(2);
   }
   const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  // Launch Vite through Node so Windows does not need to execute a .cmd shim.
+  const executable = command === "vite" ? process.execPath : command;
+  const commandArgs = command === "vite"
+    ? [fileURLToPath(new URL("../node_modules/vite/bin/vite.js", import.meta.url)), ...args]
+    : args;
+  const child = spawn(executable, commandArgs, { stdio: "inherit", env });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));
